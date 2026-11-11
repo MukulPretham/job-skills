@@ -1,0 +1,290 @@
+---
+name: job-apply
+argument-hint: "[site] [quantity]"
+description: Apply to jobs end-to-end on one named job site (Indeed, Wellfound, or a new site the user names) using the browser-control MCP and the user's already-authenticated browser. Use whenever the user says /job-apply, "job apply", "auto-apply", "apply to jobs", "apply on Indeed", "apply on Wellfound", or asks the agent to submit job applications and log them in Notion. Screens every role against ~/Desktop/resume.md, hard-skips anything requiring 2+ years or outside the user's fresher full-stack/backend lane, applies only on the requested site, verifies every submission, and records results under Job Applications → <Site> (one merged table per site, no date layer) in Notion. Do not use for job research, resume writing, or cover letters alone.
+---
+
+# Job Apply
+
+Apply to jobs on **one named site per run** as the user, through the `browser-control` MCP, using the browser profile they are already logged into. Screen every role against the resume, submit only fresher-eligible roles, verify each submission, and log it in Notion.
+
+This is a runner, not a researcher. Researching roles, rewriting a resume, or drafting a cover letter alone is not this skill.
+
+**This is living documentation.** Every run must leave the skill smarter: append what you learned to the site reference's field notes and to the changelog. The user explicitly wants future agents to keep observing and updating this skill.
+
+## Read these first
+
+| File | When | What it gives you |
+|---|---|---|
+| `references/candidate-profile.md` | Every run | Resume facts, target roles, hard eligibility rules, standing answers |
+| `references/indeed.md` | Site is Indeed | Exact search, screening, apply flow, failure signatures |
+| `references/wellfound.md` | Site is Wellfound | Exact search, dialog flow, duplicate/external rules |
+| `references/hiringcafe.md` | Site is Hiring Cafe | `/classic` search state, card extraction, employer-ATS apply flows (Ashby, Rippling, Workable) |
+| `references/cutshort.md` | Site is Cutshort | `/profile/*` URLs, pending/questionnaire queue, custom-radio answers, irreversible submit, thread messaging |
+| `references/notion-logging.md` | Before writing to Notion | Exact page hierarchy, table format, MCP calls, update rules |
+| `references/new-site-template.md` | Site is not covered | Recon protocol and the reference file to write |
+| `references/CHANGELOG.md` | Every run | What changed recently; append your own change here |
+
+Re-read the site reference at the start of every run. Sites change their markup; memory of a previous run is not evidence about the live page.
+
+**Paths.** This skill is installed in several harnesses, so script paths are written as `<skill-dir>/scripts/...`. `<skill-dir>` is the absolute path of the directory containing this `SKILL.md` (for example `~/.config/opencode/skills/job-apply`). Resolve it once at the start of the run and use the expanded absolute path in shell commands.
+
+**Canonical source.** `~/.config/opencode/skills/job-apply` is the source of truth. The Pi, Claude Code, Codex, and OpenClaw installs are symlinks to this folder, so edit this copy only. The shared ledger lives at `~/.local/share/job-apply/ledger.jsonl`, so duplicate checks work across harnesses.
+
+**MCP prerequisites.** Every harness needs two MCP servers before this skill can run:
+
+| Server | Transport | Definition |
+|---|---|---|
+| `browser-control` | stdio | `browser-control-mcp` |
+| `notion` | streamable HTTP + OAuth | `https://mcp.notion.com/mcp` |
+
+Both are installed globally in OpenCode, Pi, Claude Code, Codex, and OpenClaw. If a harness reports the tools missing or Notion unauthenticated, check its MCP list and re-authenticate only Notion:
+
+```sh
+pi mcp list          # pi mcp login notion
+claude mcp list      # claude mcp login notion
+codex mcp list       # codex mcp login notion
+openclaw mcp list    # openclaw mcp login notion
+```
+
+Never paste Notion credentials into a skill file. OAuth tokens stay in each harness's own credential store.
+
+## The non-negotiables
+
+1. **One site per run.** The user's `/job-apply indeed` means Indeed only. Never open another job board in the same run, even if it has better matches. If the user wants two sites, run the skill twice.
+2. **Ask how many applications before starting.** The user wants to choose the batch size each time. If they already gave a number (`/job-apply indeed 8`), use it. Otherwise ask one short question and wait. Do not silently pick a number.
+3. **The resume is the source of truth.** Read `~/Desktop/resume.md` at the start of every run. The profile file is a convenience summary, not a replacement. If they conflict, trust the resume for facts and ask the user.
+4. **Fresher gate: a stated minimum of 2+ years is a hard skip.** The user is a 2027 B.Tech graduate with one internship. Do not apply to a role that says "2+ years", "2–3 years", "3+ years", or equivalent, even if the rest of the description sounds perfect and even if it says "preferred". Do not rationalize it. A "1+ years" role is eligible when the JD also invites freshers, interns, or strong projects. A "0–2 years" role is eligible. When the requirement is genuinely ambiguous, skip and record the reason rather than guessing in the user's favour.
+5. **Never handle login or credentials.** If a site shows a login/sign-up screen, stop and ask the user to log in manually in the browser. Wait for them to confirm, then re-check. Never type a password, create an account, solve a CAPTCHA, or change the profile.
+6. **Never invent an answer.** If a required field asks for a fact that is not in the resume or standing answers, do not guess. Skip that job for now, add it to the "needs an answer" list, keep applying to clear jobs, and ask the user for all open answers at the end of the batch. Never submit a required field blank.
+7. **A click is not an application.** Count a submission only after the site's own confirmation surface says so (confirmation page, success heading, or the job showing an applied state). If you cannot verify it, it did not happen.
+8. **Check for duplicates first.** Use the site's own applied state and application history, plus the local ledger (`python3 <skill-dir>/scripts/ledger.py check ...`, see below). Never apply to the same job twice. Rebuild the applied set from **every row in that site's single Notion page** before opening the first job — mandatory for Hiring Cafe, whose applied state is only session-local, and cheap everywhere now that all dates share one table. A row at `Drafted` means the role is already known but not submitted: check the ledger before treating it as new, and never leave it double-listed. Never infer "not applied" from the site's silence.
+9. **Skip external ATS flows by default.** "Apply on company site", Workday, Greenhouse, SmartRecruiters, email applications: skip unless the user explicitly says to attempt them in this run.
+10. **Do not change the user's profile, resume, saved searches, or settings.** Read-only on account state.
+11. **Log only verified applications in Notion.** Skipped jobs go in the chat report, not Notion. If Notion is unavailable, keep the local ledger and tell the user.
+12. **Report honestly.** List what was submitted, what was skipped and why, what answers you filled, and what still needs the user. Never inflate a batch.
+
+## Invocation
+
+Parse the argument string. Accept these forms:
+
+| Invocation | Site | Quantity | Mode |
+|---|---|---|---|
+| `/job-apply indeed` | Indeed | ask | apply |
+| `/job-apply wellfound` / `well found` / `well-found` | Wellfound | ask | apply |
+| `/job-apply indeed 10` | Indeed | 10 | apply |
+| `/job-apply wellfound 5` | Wellfound | 5 | apply |
+| `/job-apply hiringcafe 3` | Hiring Cafe | 3 | apply |
+| `/job-apply indeed --dry-run` | Indeed | ask | screen only, no submissions |
+| `/job-apply` | ask which site | ask | apply |
+
+Canonical site names: **Indeed**, **Wellfound**, **Hiring Cafe**, **Cutshort**. Keep the user's wording in chat, but use the canonical name in Notion.
+
+Common aliases to accept without treating them as a new site:
+- Indeed: `indeed`, `in.indeed.com`, `indded` (typo)
+- Wellfound: `wellfound`, `well found`, `well-found`, `wellfound.com`
+- Hiring Cafe: `hiringcafe`, `hiring cafe`, `hiring-cafe`, `hiringcafe.com`
+- Cutshort: `cutshort`, `cut short`, `cutshort.io`
+
+**Message tone, every site:** any message sent to a recruiter or company is plain human cold text. No em dashes, no `--` separators, no bullets, no corporate filler. Two or three sentences: greet by first name, say the thing, close with an offer to talk. Written in first person as the user, never inventing experience.
+
+**External ATS exception:** Hiring Cafe is an aggregator with no on-site apply form, so its runbook authorizes finishing the application on the employer's own ATS. That exception is scoped to `references/hiringcafe.md`; every other site keeps non-negotiable #9.
+
+If the site is not covered by a reference file:
+- Do not freestyle an application flow. Tell the user the site is new, and offer a recon run that maps the flow without submitting.
+- If they agree, follow `references/new-site-template.md`, write `references/<site>.md`, add it to the table above, and append a CHANGELOG entry before applying.
+- If they do not agree, stop.
+
+## Preflight
+
+Do these in order. Do not skip the login check.
+
+1. **IST clock.** Run `python3 <skill-dir>/scripts/ist_now.py` (or `TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M %Z'`). Note the date and time. This is the date used for Notion.
+2. **Load context.** Read `~/Desktop/resume.md`, `references/candidate-profile.md`, and the site reference. Keep the resume open in context for the whole run.
+3. **Confirm site and quantity.** If either is missing, ask once. If the user says "whatever" for quantity, propose 5 and proceed only after they agree.
+4. **Browser health.** Submissions must run through `browser-control` so the user's own profile and logins are used — never a separate headless browser. Use `tools["browser-control"].status()` and `tools["browser-control"].session_current()`. Use an existing named session if the site reference names one (Wellfound uses `wellfound`). Otherwise use the default MCP session. Do not create extra sessions unless you need isolation. **Harness note:** if the harness also exposes a lighter browser tool (e.g. Hermes `browser_exec`/`browser_cdp` over CDP, no extension), use it only for read-only recon — browsing listings, reading a JD, collecting notes. Any click, form fill, or submission goes through `browser-control` against the user's authenticated browser.
+5. **Login check.** Follow the site reference's exact check. If logged out, stop and say: "You're signed out of <site>. Please log in manually in the browser, then tell me when you're done." Do not proceed until the user replies and a fresh check passes.
+6. **Notion reachable.** Run `notion-search` for `Job Applications` once. Do not create anything yet; just confirm the MCP answers. If Notion is unavailable, tell the user before applying. They may prefer to fix it first.
+7. **Ledger.** Run `python3 <skill-dir>/scripts/ledger.py list --site <site> --limit 10` and keep recent company/role pairs in mind for duplicate checks.
+
+## Screening
+
+Use the rules in `references/candidate-profile.md`. The short version:
+
+**In lane:** full-stack, backend, software engineer, MERN, React/Node, Python, Java/Spring Boot, AI/LLM engineer, junior DevOps/SRE, SDE fresher, software trainee (paid, real engineering).
+
+**Hard skip:**
+- Explicit minimum of 2+ years (including "2+ preferred"), senior/staff/lead/principal/architect/engineering manager.
+- QA/SDET/manual testing, L1/L2 support, night-shift operations, data/business analyst.
+- .NET-only, PHP-only, SAP/ABAP, Salesforce, or another stack the resume does not support.
+- Unpaid internships, "training + placement" fees, commission-only, bond/agreement with a fee.
+- External ATS or "apply on company site" (unless the user allowed it this run).
+- Already applied, duplicate listing, or a listing whose title and description do not match.
+- Low-quality mass listings (Ameerpet-style ₹1.3–3.9L "full stack" ads, vague "any graduate" engineering roles).
+
+**Case-by-case:**
+- "0–2 years", "fresher", "entry level", "graduate", or no years stated + knowledge-based wording → eligible.
+- "1+ years" → eligible only if the same JD mentions freshers, internships, or strong personal projects. If it reads like a mid-level role, skip.
+- Paid internship → eligible if the stipend is stated or clearly non-zero. "Contribution-based" counts as paid but flag it.
+- Salary below the user's ₹4 LPA expectation is not an automatic skip; quality and role fit decide. Unpaid is a skip.
+
+Every skip gets a one-line reason. The user wants to be able to override.
+
+## The apply loop
+
+For each candidate, one job at a time, sequentially on the same tab:
+
+1. **Open the job page** using the safe URL pattern in the site reference (never a query-param search URL that triggers bot protection).
+2. **Preflight the page:** duplicate/applied state, external-apply smell, stated years, salary, role fit. Decide apply or skip with a reason.
+3. **Apply** using the site-specific flow. Read the live page before clicking; do not reuse stale refs or selectors from an old snapshot.
+4. **Fill required fields** from the resume and standing answers. If something is genuinely unknown, leave the job unsubmitted, park the URL and the exact question, and move on.
+5. **Submit**, wait for the site's async state, and verify the confirmation surface.
+6. **Record** the verified application in the local ledger and in the run list:
+   `site, company, role, salary, yoe_required, status=Applied, url, applied_at (IST), notes`.
+7. **Write it to Notion immediately** — do not batch. Once the confirmation surface is verified, append that row to `Job Applications → <Site>` (append to the single merged table; never create a date page) before opening the next job. The user asked for this explicitly on 2026-11-03: every verified application must be visible in Notion right away, so an interrupted run never loses a row. If the Notion write fails, keep the ledger entry, tell the user, and continue only if they say so.
+8. **Pace** between jobs as the site reference says (usually 2–3 seconds). Handle 429/Cloudflare by waiting, not by hammering.
+9. Stop when the requested number of **verified** applications is reached, or when the eligible list is exhausted. Failed submissions do not count toward the quantity.
+10. If jobs were parked for a missing answer and the user supplies it, revisit them before ending the run when the requested quantity has not been met.
+
+If a site-specific flow contradicts its reference, trust the live page, note the deviation, and update the reference at the end of the run.
+
+### Local ledger
+
+The ledger is the duplicate-protection and Notion-fallback record. Run it with the expanded absolute path so it works from any directory (replace `<skill-dir>` with the directory containing this `SKILL.md`):
+
+```sh
+# Before applying
+python3 <skill-dir>/scripts/ledger.py check \
+  --site Indeed --company "Acme" --role "Backend Developer" --url "https://..."
+
+# After a verified submission
+python3 <skill-dir>/scripts/ledger.py add \
+  --site Indeed --company "Acme" --role "Backend Developer" \
+  --salary "₹6,00,000/yr" --yoe "1+ yr" --status Applied \
+  --url "https://..." --applied-at "2026-11-03 14:32 IST"
+```
+
+If the ledger says `"match": true`, treat the job as already applied and skip it unless the user explicitly says otherwise. For cross-site duplicate safety, run the same `check` once **without** `--site`; if the same company and role were already applied to through another site today, ask the user before reapplying.
+
+## Parallel multi-site runs (explicit user override)
+
+Non-negotiable #1 is one site per run. When the user explicitly overrides it and asks for several sites at once (for example "Indeed, Wellfound and Hiring Cafe, 3 subagents, 10 each"), do these five things first. Skip any one and the batch duplicates work or loses rows.
+
+1. **Confirm the pages, do not create a tree.** The root `Job Applications` page already exists with one page per site. Verify each agent can fetch its site page before spawning; never create a date page or a second site page, and expect all agents to append to the *same* three tables (each its own page, so no collision).
+2. **Freeze the applied set once, in the parent.** Fetch each site's single page — that one table now covers every date — plus the ledger, and write one shared `prior-applied.md` for older rows and a `prior-applied-2.md` that grows with the batch. Give every agent both paths. Never let each agent re-derive it — that is how double applications happen. `Drafted` rows are not prior applications: list them separately as "known, unsubmitted, re-check before applying".
+3. **One browser-control session per agent, named for the site** (`indeed-apply`, `wellfound`, `hiringcafe`). Drive it through the CLI — `browser-control execute --session <id> --json --file step.js` — and pass `--session` on every call. Separate sessions are separate tabs, which is exactly what the user asked for and what makes parallel automation safe.
+4. **Give each agent a site brief file, not a chat message.** Facts, standing answers, hard rules, its Notion page id, its ledger commands, its work-dir JSONL path, and the final-answer shape. Agents have their own context and cannot see this conversation.
+5. **Have each agent append every verified application to `work-<site>.jsonl` as well as Notion.** After the batch, the parent audits that file: count applied rows, assert no `2+ yr` slipped through, check company+role duplicates, and reconcile against the ledger and Notion. A child's summary is a self-report, never proof.
+
+Budget reality: Indeed and Wellfound can each yield 10 in 35–40 minutes. Hiring Cafe costs an ATS detour per application and often caps well below 10; expect to re-dispatch a continuation agent with the already-applied list appended, and report the honest total rather than rounding up.
+
+## When to stop early
+
+Stop the batch and report instead of pushing through when:
+
+- The site logs you out, shows a CAPTCHA/2FA challenge, or asks for credentials. Ask the user to take over manually.
+- The site starts returning a persistent 429/Cloudflare wall after the reference's wait-and-reload remedy.
+- Three consecutive submissions fail for the same non-obvious reason. One retry per job is fine; blind replay is not.
+- The page structure has changed enough that the reference's selectors no longer find the apply control. Trust the live page, stop, and update the reference rather than improvising a submit.
+- Notion is unreachable and the user wants logging guaranteed. Finish the current job, keep the ledger, and ask whether to continue.
+
+Never "make it work" by inventing a field value, skipping verification, or trying an external ATS the user did not authorize.
+
+## Notion logging
+
+Exact calls and examples are in `references/notion-logging.md`. The structure is fixed and **flat — no date layer** (the user removed it on 2026-11-07):
+
+```
+Job Applications                (page 40d3109c-a531-8132-847b-e945a98a70a1)
+├── Wellfound                   (page — one table, all dates merged)
+├── Hiring Cafe                 (page — one table, all dates merged)
+├── Indeed                      (page — one table, all dates merged)
+├── Run Notes                   (page — consolidated log, newest first)
+└── Hyderabad Outreach          (page — people + outreach mail, not applications)
+```
+
+Each site page holds exactly one table: `## Applications`, one row per application, `Applied At (IST)` carrying the date. Never create a date page, a second table, or one page per application. `Run Notes` and `Hyderabad Outreach` are siblings, never inside a site page's table — applications never go in either.
+
+A `Draft — <date>` or `<n> <Month> <year>` page under the root is a temporary harvest queue of `Drafted` rows, not part of the hierarchy. Never write applications into one, re-screen every row on it at apply time, and delete it to Trash when the user asks after a batch — the site table and the ledger are the only permanent record.
+
+Tenancy counts to sanity-check a fetch against: Wellfound **67 rows** (49 before the 2026-11-09 batch plus 18 that day, no `Drafted` rows left), Indeed 18, Hiring Cafe 21. A fetch far shorter than these means truncation — re-fetch, never rebuild from a partial table.
+
+Table columns, in this order:
+
+| Company | Role | Salary | YOE Required | Status | Applied At (IST) | Link |
+|---|---|---|---|---|---|---|
+
+- **Salary:** exactly as posted (`₹6,00,000/yr`, `₹25,000/mo`), or `Not listed`.
+- **YOE Required:** `Fresher`, `0-1 yr`, `0-2 yr`, `1+ yr`, or `Not stated`. Use `2+ yr` only when the user explicitly overrides the fresher gate for a specific job. For submitted jobs, prefer the most specific number the JD gave. The live tables also contain bare `0 yr` / `1 yr` cells — match the row style you are editing rather than normalising a whole column.
+- **Status:** `Applied` on creation. Allowed values: `Applied`, `In Progress`, `Interview`, `Offer`, `Rejected`, `Withdrawn`, plus `Drafted` for a harvested role that was never submitted. A `Drafted` row is not an application: set it only when a role was researched and queued, and move it to `Applied` **only** on a verified submission.
+- **Applied At (IST):** `YYYY-MM-DD HH:MM IST`, captured at verification time. For `Drafted` rows write `YYYY-MM-DD (drafted)` — the date it was queued, not an application time.
+- **Link:** `[View job](url)`.
+
+Rules:
+- Confirm the IST date with the clock script before writing; it goes in the `Applied At` cell. A run that crosses midnight IST just writes the two timestamps — there is no date page to split.
+- Search for the root `Job Applications` page first. If it does not exist, create it as a private draft, then tell the user it is private and offer to move it. Never create a duplicate.
+- Find the site page as a direct child of the root, matching titles case-insensitively and accepting emoji-prefixed titles (`🔵 Indeed`, `🟢 Wellfound`, `☕ Hiring Cafe`, `📝 Run Notes`, `🤝 Hyderabad Outreach`). Create only if genuinely absent.
+- Append rows to the site's existing table. Do not create a second table, a database, per-application pages, or date pages.
+- Verify the write by fetching the site page and checking the new rows.
+- Append to the single **`Run Notes`** page (newest entry at the top, under a `## YYYY-MM-DD — <title>` heading) after the last verified application, or when stopping early. Log what the site tables cannot hold: the verification surface actually observed and any deviation from the runbook, skip counts grouped by reason, parked jobs with the exact blocking question, flags for the user (below-baseline pay, a structurally exhausted pool), and which skill files were updated. Never put applications in Run Notes, and never put narrative inside a site table.
+- If a Notion write fails, do not claim it succeeded. The local ledger is the fallback; report the failure with the exact error.
+
+**Status updates:** when the user later says "mark <company> as rejected/interview", find the row in that site's table (match on company **and** role — several companies have two rows), replace that row's Status cell, and verify. If more than one row matches, ask which one. Do not rewrite unrelated rows.
+
+## Reporting
+
+End every run with this shape:
+
+```
+Run: Indeed — 2026-11-03 (IST) — requested 10, submitted 7, skipped 12, needs answers 2
+
+| # | Company | Role | Salary | YOE | Status | Link |
+...
+
+Skipped (grouped by reason):
+- 2+ years (5): ...
+- External ATS (3): ...
+- Unpaid/training (2): ...
+- Duplicate/mislabeled (2): ...
+
+Answers I filled on your behalf: ...
+Needs your answer (not submitted): ...
+Notion: Job Applications → Indeed (link)
+Notes: Job Applications → Run Notes (link)
+Verification: each row above was confirmed on the site's own confirmation surface.
+Running total today: 7 applications.
+```
+
+Then ask whether to continue with another batch or change any standing answer.
+
+## Self-update protocol (required after every run)
+
+This skill is expected to get better with use. Before finishing:
+
+1. **Append field notes** to the relevant `references/<site>.md` under `## Field notes (append-only)`, in this shape:
+   `- YYYY-MM-DD — observation — what you did — why it matters`.
+   Capture selector changes, new question types, new required fields, shifted rate limits, new external-ATS patterns, and any flow that needed a retry.
+2. **Update the standing answers** in `references/candidate-profile.md` if the user gave a new durable answer (CTC, notice, start date, relocation, a new certification or project). Do not put one-off answers there.
+3. **New site:** create `references/<site>.md` from `references/new-site-template.md`, add it to the reference table above and to the canonical-site list, and note it in the changelog.
+4. **Changelog:** append a dated entry to `references/CHANGELOG.md` for every behavioural change. Say what changed and why.
+5. **Never store credentials, cookies, tokens, or unnecessary personal data** in the skill. Standing answers and resume facts are the only personal data allowed.
+6. If the live site contradicts the reference, the live site wins for this run. Record the deviation so the next agent does not repeat the mistake.
+
+## Quick checklist
+
+- [ ] Site parsed, canonical name chosen
+- [ ] Quantity confirmed
+- [ ] Resume + candidate profile + site reference read
+- [ ] IST date/time captured
+- [ ] Browser status checked; correct session
+- [ ] Login verified (or user asked to log in and confirmed)
+- [ ] Notion search reachable
+- [ ] Pre-batch applied set rebuilt from that site's single Notion table (mandatory for Hiring Cafe); `Drafted` rows treated as known-but-unsubmitted
+- [ ] Each job screened; skips have reasons
+- [ ] No role with 2+ years submitted
+- [ ] Each submission verified on the site
+- [ ] Ledger updated
+- [ ] Rows appended to the site's existing table (no new page) and verified
+- [ ] Run Notes entry appended (deviations, skips, parked jobs, flags, skill updates)
+- [ ] Report includes submitted, skipped, answers, needs-answers, Notion link, IST date
+- [ ] Field notes / changelog updated

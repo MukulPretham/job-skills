@@ -1,0 +1,398 @@
+---
+name: job-update
+description: "Job status sync + job-apply dispatch and reporting rules."
+version: 1.2.0
+author: Rex (Job Assistant)
+license: MIT
+platforms: [macos]
+metadata:
+  hermes:
+    tags: [jobs, notion, gmail, browser, status-tracking]
+---
+
+# job-update
+
+Refresh the **Status** column of the Notion *Job Applications* tracker using
+evidence found in the user's Gmail. One run = one site (Indeed / Wellfound /
+Hiring Cafe), so the three can run in parallel without colliding.
+
+## When to use
+
+The user asks to "update application status", "check if any company replied",
+or "sync Notion with Gmail". Not for *sending* applications — that is `job-apply`.
+
+**A board-inbox question is not a Gmail question.** "Am I getting any messages on
+<board>" / "any replies" is answered from the board's own conversations page over the
+browser-control MCP — per-board URLs, stage filters and read traps are in
+`references/site-inbox-check.md`. Board messages are often not mirrored to email, so a
+Gmail-only answer understates a board full of pending applications.
+
+**An open `[Questionnaire]` is unanswered work, not a message.** A pending screening
+questionnaire is the only thing blocking that recruiter, so an inbox review ends by naming
+which threads are still unanswered and offering to submit them — never by reporting "no
+messages" while several questionnaires sit empty. Standing answer policy: accept
+relocation / available immediately / salary works — **except that pay acceptance is the
+user's decision**. Put the role's pay range into the question and submit only what he
+approves: he routinely skips below-target pay (a ₹3–4k/mo internship, a ₹2–3L/yr role)
+while a remote ₹8–11L role gets a yes. Form mechanism, selected-state detection and the
+confirm dialog are in `references/site-inbox-check.md`.
+
+**Outbound messages carry the user's voice, not the agent's.** Anything sent to a
+recruiter or company is plain human cold text: greet by first name, two or three
+sentences, say the thing, close by offering a call. No em dashes, no `--` separators,
+no bullets, no corporate filler, and no invented experience. Machine punctuation is the
+thing he objects to, so a dash-cleaned short message is the target shape. Composer
+mechanics and the post-send verification are in `references/site-inbox-check.md`.
+
+The reporting cadence and dispatch rules below apply to **every** job task, including
+a `job-apply` run: they are how this user wants the work delivered, whichever skill
+does the submission.
+
+## Architecture (why it works this way)
+
+- **Two browser drivers, routed by task.** `browser_exec` / `browser_cdp` over CDP on
+  `127.0.0.1:9222` for light read-only work: Gmail lookups, status checks, browsing.
+  The `browser-control` MCP, one named session per site (`wellfound`, `indeed-apply`,
+  `hiringcafe`, `cutshort`), for anything that submits, because it drives the user's real
+  `Profile 4` Chrome where the job-board logins live. The two run in different Chrome
+  profiles and therefore see different signed-in sessions, so a CDP tab reads those
+  boards as signed out. Cold start, session revival and CLI flags live in
+  `references/browser-driving.md`; read it before the first browser call of a run and
+  treat `relay: stopped` as "not started yet", never as a blocker.
+- **Gmail is read through that same signed-in Chrome session.** Check the Google Workspace path first
+  (`productivity/google-workspace/scripts/setup.py --check`); if it does not print
+  `AUTHENTICATED`, do not start an OAuth setup mid-task — use the browser reader
+  below, which needs no credentials.
+- **`scripts/gmail_lookup.py`** is the only Gmail access primitive. It opens a
+  throwaway tab, waits for the search results to render, scrapes `tr.zA` rows,
+  returns JSON, and closes the tab. Never drive the Gmail UI by hand.
+- **Notion is reached over MCP** (`notion_fetch`, `notion_update_page`), not the browser.
+
+## Prerequisites (check before starting)
+
+Route first: the checks below cover the CDP debug instance used for read-only work. An
+**application** run needs the other driver — Chrome launched as `Profile 4` plus the
+browser-control relay — and the routing table, cold-start sequence and CLI flags are in
+`references/browser-driving.md`.
+
+```bash
+curl -s http://127.0.0.1:9222/json/version | head -3   # must return JSON
+/usr/bin/python3 -c "import websocket; print('ws ok')" # websocket-client
+```
+
+**Login state check.** `scripts/session_check.py` reads cookies over CDP (no tab,
+~0.2s) and returns a *three*-valued verdict per site:
+
+```bash
+/usr/bin/python3 <skill-dir>/scripts/session_check.py wellfound indeed gmail
+# wellfound   logged-in  verified=2026-11-06  n=16
+# hiringcafe  unknown    verified=None        n=0
+```
+
+- `logged-in` — an auth cookie matched a pattern confirmed against a real session.
+- `signed-out` — reachable only for a site whose pattern is verified.
+- `unknown` — the pattern is unverified, so a miss proves nothing. Treat it as
+  "ask", never as "drop the board": a false negative may just mean the session
+  lives in another cookie jar on the same machine.
+
+**A cookie probe can never prove someone is signed out.** The only evidence of
+that is the rendered page: a `/login` + `/sign-up` pair in the nav means signed
+out; Home / Profile / Jobs / Applied / Messages means signed in. Check the page
+before reporting, or the user gets told to log in to an account they are already
+in. Known auth carriers — Wellfound `_wellfound` (httpOnly; `rl_session` and
+`rl_user_id` are Reforge analytics and match nothing), Indeed
+`__Secure-PassportAuthProxy-*` / PPID, Google `SID` / `__Secure-1PSID`.
+
+Run the check before any `job-apply` dispatch: a board that is signed out produces
+no queued work, and discovering it at dispatch time burns the whole subagent run.
+Logins are perishable — check daily, not once. Sites covered: wellfound, indeed,
+hiringcafe, gmail, linkedin; add more to `SITES` in the script.
+
+**Boards the script does not cover** (Cutshort, Apna, Shine, Hirist, Stripe, and anything
+else a harvest adds) are verified on the rendered page — per-site signals, traps and the
+sweep protocol are in `references/login-verification.md`, and each board's own
+inbox/status page ("any replies on <board>") is mapped in `references/site-inbox-check.md`. Sweep **every distinct site
+named in the batch** before the first application, count the roles per site, and report
+one verdict each: a board that is signed out is one decision for the user up front,
+not a mid-batch surprise.
+
+If 9222 does not answer, the debug instance is not running — start it rather than
+reporting a blocker. Chrome 136+ refuses `--remote-debugging-port` on the default
+profile, so it must be the dedicated user-data-dir:
+
+```bash
+open -na "Google Chrome" --args --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/.hermes/chrome-debug" --no-first-run --no-default-browser-check
+curl -s http://127.0.0.1:9222/json/version   # JSON within ~3s
+```
+
+That profile is already signed in as the user; never relaunch or profile-copy the
+default one. Then reduce to a single tab before any DOM work — see the pitfall below.
+
+## Tracker shape
+
+`Job Applications` (page `40d3109c-a531-8132-847b-e945a98a70a1`) is **flat — there is
+no date layer**; the day-wise pages are archived. Its five direct children:
+
+| Child page | ID | What it holds |
+|---|---|---|
+| `Wellfound` | `4113109c-a531-8184-a738-c2ff22575c43` | one merged table, every day |
+| `Hiring Cafe` | `4113109c-a531-819982a1d2e3afb220bb` | one merged table, every day |
+| `Indeed` | `4113109c-a531-8134-853b-eaf20c74551d` | one merged table, every day |
+| `Run Notes` | `4113109c-a531-81a5-93b9-f1c654ae58c0` | consolidated log, newest first — not an application table |
+| `Hyderabad Outreach` | `4113109c-a531-810b-9468-ca04e63cc1d1` | people + outreach emails sent — not an application table |
+
+Never create a date page; the day-wise layer (2026-11-03 → 11-06) is archived. All
+rows for a site live in that site's single table, `Applied At (IST)` carrying the
+date — so a site's applied set is one fetch, not one per day.
+
+Each site page is a markdown table:
+
+```
+| Company | Role | Salary | YOE Required | Status | Applied At (IST) | Link |
+```
+
+**Status is the only column to edit.** Rewrite the whole row line with
+`notion_update_page` `command="update_content"`:
+`old_str` = the exact fetched row, `new_str` = same row with the status cell changed.
+Copy the fetched text verbatim — rows contain escapes like `6015\_Software` and `\$20k`.
+
+- **Questionnaire and reply activity is not a Status value.** Answering a screening form or messaging a recruiter leaves the row at `Applied`: the vocabulary has no value for it, and inventing one breaks what the sync classifies against. Record the activity in `Run Notes` (forms submitted, forms skipped and why) and leave the seven columns alone.
+
+## When the user restructures the tracker
+
+The user reshapes this tracker himself and says only "I restructured the page — check
+it". Expect the skills to be wrong afterwards: the shape is documented in **five
+places across two skills**, and fixing one leaves the rest to recreate the old layout
+on the next run.
+
+1. `notion_fetch` the root, enumerate its children, and fetch each child to read its
+   real header row. The page is the truth; the skill is a claim about the page.
+2. Read `Run Notes` **first** — it is the tracker's own changelog and states what was
+   merged, renamed, or archived, plus the row counts preserved. Those counts are the
+   baseline every later fetch is checked against, so a truncated fetch is visible as
+   a number that is too small instead of an empty-looking success.
+3. Fix every occurrence, then `search_files` the whole tree for the stale tokens
+   (`date page`, `per date`, `every date`, `→ Date`) instead of trusting memory about
+   where they live. In `job-apply`, the shape is written in its SKILL.md (frontmatter
+   description, non-negotiable #8, apply-loop step 7, parallel-run steps 1–2, the
+   Notion logging block and its rules, quick checklist), in `notion-logging.md`
+   (hierarchy, page resolution, Run Notes template, status values, reporting path),
+   in `hiringcafe.md` §4.0 (the pre-batch applied-set sweep), and in the CHANGELOG.
+4. **A new status value must land in both skills' status lists** (here and the
+   `Status:` bullet in `job-apply`'s Notion-logging section). A value one skill writes
+   and the other does not know is a status the next sync classifies as unknown.
+5. Record the page IDs in this skill's Tracker shape table. IDs make every later run
+   a direct fetch instead of a title search — and a title search returns `Run Notes`
+   and `Hyderabad Outreach` too, whose body text names every site.
+
+**Editing `job-apply`:** it is a symlinked copy of
+`~/.config/opencode/skills/job-apply`. Patch that canonical path directly with
+`read_file`/`patch`/`write_file`; `skill_manage` cannot resolve it (it looks only
+under a category directory) and reports "not found in active profile". Do **not** strip
+its `browser-control` wording: those runs submit through the browser-control MCP on the
+site's named session, which is the correct driver for a signed-in apply flow.
+
+## Status vocabulary
+
+| Status | Evidence required |
+|---|---|
+| `Drafted` | Harvested as a candidate, never submitted — leave it alone, and never promote it to `Applied` on a hunch |
+| `Applied` | Only the submission confirmation (default; leave unchanged) |
+| `Viewed` | Explicit "your application was viewed/opened" wording |
+| `Assessment` | Online test, coding challenge, take-home, HackerRank/Codility link |
+| `Interview` | Interview invite, scheduling link, call request |
+| `Offer` | Offer letter, "pleased to offer" |
+| `Rejected` | "not moving forward", "other candidates", "unfortunately", "decided not to proceed" |
+| `Withdrawn` | User-initiated withdrawal confirmation |
+
+Anything that does not clearly map: **leave the status alone** and list it under
+"needs human" in the report. A wrong rejection status is worse than a stale one.
+
+## Procedure
+
+1. `notion_fetch` the site's single page and parse its one table (`## Applications`).
+   Record page ID, the exact table rows, company names, roles, and current status.
+   Expect one row per application, all dates merged — Indeed >18 rows, Wellfound
+   >50 (32 `Applied` + 20 `Drafted`), Hiring Cafe >20. A short fetch means the page
+   changed, not that there is nothing to sync.
+2. For each company, run the lookup — batch several per shell call:
+   ```bash
+   cd ~/.hermes/profiles/rex/skills/job/job-update/scripts
+   /usr/bin/python3 gmail_lookup.py "Company Name"
+   ```
+   Use the company name only. If the name is generic (e.g. `Build AI`, `Certa`,
+   `Ema`), also try the role or the company + `application` to cut noise.
+3. Classify each thread against the vocabulary above. Prefer the newest
+   application-specific thread; ignore digests.
+4. Apply only the changes. Batch `update_content` operations per page.
+5. Write the full result to `~/.hermes/profiles/rex/cache/job-update/<site>.json`
+   (one object per job: company, role, page_id, old_status, new_status, evidence,
+   thread_date, confidence).
+6. Re-`notion_fetch` the edited pages and confirm each new status is present.
+
+## Parallel per-site runs
+
+Status refresh is fan-out work: one site per agent, all three at once.
+
+- Give each agent the **exact page IDs** for its site plus the expected row count,
+  so a short fetch is visible immediately instead of silently skipped.
+- Every agent writes `~/.hermes/profiles/rex/cache/job-update/<site>.json` with a
+  row for **every** job it checked, including unchanged ones. Reconcile against
+  that artifact, not against the agent's prose summary.
+- Each agent re-fetches its pages after writing. A child reporting "updated" is a
+  self-report; the verification fetch is the only proof.
+- `gmail_lookup.py` creates and closes its own tab per query, so parallel agents do
+  not collide in the shared browser — provided every agent uses the script and none
+  drives Gmail by hand.
+
+## Pitfalls
+
+- **Deleting a table row with `update_content` breaks the whole table.** Replacing a row line with an empty `new_str` empties the row, merges its block with the rows below, and every later row drops out of the table into escaped-pipe text (`\| ... \|` separated by `<br />`) while the header stays. To remove rows, rebuild the full table minus those rows and send it with `replace_content`, then re-fetch and confirm the rows still parse as a table and the row count matches.
+- **A multi-row table written in one shot can land as one row plus escaped junk.** A create/insert payload carrying N rows sometimes keeps only the first as a real table row and dumps the rest as `\| cell \| cell \|` joined by `<br />` inside one paragraph, which renders as escaped text under a one-row table while looking fine in the API response. A returned `page_id` is not success: fetch the page and count lines that start with `| ` and end in ` |`. When the count is short, rebuild with `replace_content` sending the heading plus every row in one string (that parses correctly) and fetch again to confirm the count.
+- **Wrap file paths in backticks when writing them into Notion.** A bare `references/<file>.md` gets auto-linkified into `[<file>.md](http://<file>.md)`, a dead external link; backticks keep it literal.
+- **Anchor an append on the row tail, never on the company cell.** Notion auto-links bare domains in cells it renders (`orqum.ai` becomes `[orqum.ai](http://orqum.ai)`) and escapes `$` amounts as `\$`, so an `old_str` built from the last row's company or salary fails to match on the very next append and the whole batch of rows is refused. Anchor on the cells that cannot be rewritten — the `YOE | Status | Applied At (IST) | [Job](url)` tail of the last row — and append the new rows after it.
+- **Quote `$` salaries in single quotes when writing the ledger.** `--salary "$60k – $70k"` reaches the script as `0k – 0k` because the shell still expands `$60k` inside double quotes; write `--salary '$60k – $70k'` or spell it `USD 60000-70000/yr`. The bad value persists silently and only surfaces when someone reads the ledger back.
+- **One tab, or the DOM you read is not the page the user sees.** With several tabs
+  open on the same site, a scripted `js()`/CDP call evaluates in one while the
+  screenshot and the visible window show another; a modal then reads as empty
+  (`textContent` 0, no `textarea`, AX dialog with zero children) while it is plainly
+  rendered on screen. Check `Target.getTargets` and close extras with
+  `Target.closeTarget` before rewriting selectors for a phantom. A control that is
+  visible but absent from the DOM usually means the wrong tab, not a shadow root.
+- **React inputs ignore a plain `element.value = ...`.** Set through the native
+  setter and fire `input` + `change`:
+  `Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set.call(el, text)`.
+  Poll for the control you need rather than sleeping a fixed time; apply modals
+  render 1–3s after the click, and sometimes much later.
+
+- **Wellfound sends digest mail** — "New jobs: … at SonicAI and 7 more jobs" —
+  which mentions companies inside the *snippet*. Searching a company name will
+  match these. They are not application updates. Only "An update from <company>",
+  "Application to <company> successfully submitted", or recruiter mail counts.
+- **Indeed Apply confirmations** are auto-generated for every application and mean
+  nothing beyond `Applied`. Do not promote a status because a confirmation exists.
+- Snippets are truncated at ~150 chars. If a thread's meaning hinges on the
+  truncated part, open the thread — or mark it needs-human rather than guessing.
+- One company can own several rows (Rubrik ×2, Nimble Solutions ×2, red6.ai ×2).
+  Match on **company + role**, never company alone.
+- **Gmail loads asynchronously, and "Conversations" is a false ready-signal** —
+  the same text exists as a sidebar label before any results render, so a page-text
+  wait returns an empty result set that looks like "no mail". Wait for a `tr.zA`
+  row or an `N–M of K` header instead. The script polls for rows with a 25s cap;
+  `n_rows` 0 with an empty `count` is a failed lookup, not a negative answer.
+- **Empty `raw` is a hard failure, not an empty result.** A healthy "no mail" page
+  still renders chrome (sidebar, search box) — several hundred chars. `raw` of `""`
+  means the tab never loaded: retry once, then report the row as *unverified*, never
+  as "no mail found".
+- Some company names keep failing while neighbours succeed in the same run
+  (observed: Consensys, 4 attempts, `raw` always empty). Fall back to a sender-domain
+  search — `ashbyhq`, `greenhouse`, `lever`, `workable`, `smartrecruiters` — and read
+  the returned subjects for the company, since ATS confirmations come from the ATS
+  domain rather than the employer.
+- Parallel runs share one browser: keep each lookup short-lived (the script closes
+  its tab). Never leave extra Gmail tabs open.
+
+## Applying a `Drafted` batch
+
+The harvest parks roles at `Drafted`; a later request submits them. That run is a
+`job-apply` run whose input list is the tracker itself.
+
+A dated `Draft — <date>` page is a sibling of the site pages under `Job Applications`,
+grouped by tier (A/B/C) and then by site. When the user points at one, that page — not a
+site table — is the input: read the tiers, honour whichever tiers he excluded, enumerate
+the distinct sites with their queued counts, and run the login sweep from
+`references/login-verification.md` before opening the first job. Two judgement calls
+belong to the user, not the sweep: a role hosted on a direct company portal that submits
+through an ATS (e.g. Stripe careers → Greenhouse embed) still needs the external-ATS
+authorization, and a listing in a lower tier that states a 3+ year minimum is skipped
+regardless of the tier it was filed under.
+
+1. Fetch the site page and take **only** rows whose Status is exactly `Drafted`. The
+   user's "the new ones" / "the drafted ones" means that value, not recent rows.
+2. Open every job live before deciding. A harvested note ages: the posting may now be
+   removed ("The job listing is no longer available"), newly unpaid, or newly
+   years-gated ("1–3 Years", "1–2 years"). Re-screen against the fresher gate at the
+   moment of applying, not against the note. **Budget for attrition:** a day-old draft
+   batch typically loses about half — expect a dead listing, an unpaid one and an
+   external-apply one in every five, so report the honest submitted count instead of
+   straining to hit the draft count.
+   **Pre-filter by the harvest's own years column.** When the `Drafted` page records a YOE per row, trust it for a first pass — it tracks the job page's `Experience` meta — and drop every `2+` row without opening it, spending page loads only on the survivors. A recent 50-row harvest was 40% 2+ years, so this saved about 20 of 50 loads with no wrong calls.
+3. Apply, verify on the site's own applied state, then flip that row `Drafted` →
+   `Applied` with the IST timestamp in the same pass — do not batch the Notion writes
+   to the end. Skipped rows stay `Drafted`, with the reason in Run Notes.
+4. Expect a few `Drafted` rows to be **already applied**: an earlier session submitted
+   them and never logged it, so the page shows an applied chip and the click does
+   nothing. Check the site's application list for the real date, record that, and do
+   not re-submit — a fresh timestamp on an old application is a lie the next sync
+   cannot detect.
+5. Match rows on **company + role**, never company alone: one company can hold an
+   applied req and an unapplied draft at the same time.
+6. **Years resolution for a drafted row.** The harvest already judged the row eligible,
+   so do not re-open the whole question. When the live page states no minimum, or the
+   Apply dialog's only warning is the soft `Improve your odds ... (1+ years in
+   Engineering role)`, submit it and flag the stretch in the report ("body asks 1–3
+   years"). A stated `2+` anywhere — dialog bar or body text — still stops it. Neither
+   auto-skip a `1–3 years` body nor hide it: the report is where the user overrides.
+
+7. **Close out the `Draft — <date>` page you were pointed at.** After the batch, append a short status block naming which of its listings were applied (and which page now tracks them) and which are still unapplied. Left untouched, the harvest page reads as a queue of open opportunities that no later run can tell apart from genuinely pending work.
+
+## Dispatching a `job-apply` run
+
+A child cannot see this conversation and will not re-derive your judgement. Before
+dispatching:
+
+1. **Preflight the session** with `session_check.py` *and* the rendered page. A run
+   that starts against a signed-out board spends its whole budget on nothing.
+2. **Pre-create nothing — confirm the page instead.** The site page already exists at
+   the root with the 7-column header; the only pre-write is making sure that page is
+   reachable. Never create a date page or a second site page (children doing so
+   produces duplicates).
+3. **Freeze the applied set in the parent** (the site's single table, all rows, plus
+   `~/.local/share/job-apply/ledger.jsonl`) and hand the child the list. Skip
+   `Drafted` rows when building it — a draft is not an application, and the harvest
+   that created them already ruled out the 32 companies applied to earlier.
+4. **Give the child a brief file, not a chat message** — start from
+   `templates/job-apply-dispatch.md`.
+5. **Require an artifact**: the child appends every verified application to
+   `~/.hermes/profiles/rex/cache/job-apply/<site>-<date>.jsonl` as well as Notion.
+   Audit that file afterwards; a child's prose summary is a self-report, not proof.
+
+## Reporting
+
+Two moments, both unprompted. Open with a plain status word so the user never has
+to ask "is it done?":
+
+```
+STARTED — 1 agent, 2 Wellfound applications, ETA ~10 min
+FINISHED — 2 submitted, 3 skipped, 1 needs your answer
+```
+
+- Send `STARTED` at dispatch and `FINISHED` the instant the agent returns. Do not
+  wait to be asked, and never let a completion report open with a table: a report
+  that reads like more analysis is indistinguishable from silence, and the user
+  will read it as "nothing happened".
+- Per site: `checked N · updated M · unchanged K · needs-human J`, then a table of
+  the updates with evidence quoted in ≤12 words. Never claim an update that the
+  verification fetch did not show.
+- Keep it short and direct — counts, the changes that matter, the needs-human items.
+  No narration of which agent did what, no agent-to-agent architecture talk. When a
+  peer agent raises a design question mid-task, answer it in one line and return to
+  the job: a blocked errand is what the user remembers, not the discussion.
+- **A readiness check reports a table, one row per site**: `Site | status | evidence |
+  queued roles`, evidence in ≤12 words ("dashboard shows his name", "nav Login +
+  auth/validate 401", "no account needed — Greenhouse embed"). Then list only the
+  decisions it forces: which site needs a manual login, which ATS needs authorization,
+  which queued roles already fail the fresher gate. Close by asking how to batch it
+  (site order vs. a fixed count per site) and submit nothing until he answers.
+
+- **Reconcile three counts before reporting: the board's own counter, the ledger (`~/.local/share/job-apply/ledger.jsonl`), and the site table's rows.** They legitimately differ, because a virtualized list renders fewer threads than applications and a board can count applications the log never recorded. Quote each number and name the gap as an open item instead of quietly adopting whichever figure reads best: an unexplained application is a real lead, and a tidy report hides it.
+
+## Deliver the task, not the toolchain
+
+The unit of delivery is submitted rows and verified statuses — not scripts, schemas
+or protocols. Build tooling only when it directly unblocks the current request, and
+when it does, still say "blocked on X, need Y" in the same turn. If the deliverable
+cannot be produced, lead with that, name the single thing needed to unblock it, and
+offer the nearest deliverable that *can* be done now (e.g. the same batch on a site
+whose session is live).
